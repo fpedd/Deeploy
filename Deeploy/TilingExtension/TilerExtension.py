@@ -73,8 +73,10 @@ class Tiler():
         Symbolic memory constraints for the tiling problem.
     visualizeMemoryAlloc : bool
         Flag to enable memory allocation visualization.
-    memoryAllocStrategy : {"TetrisRandom", "TetrisCo-Opt", "MiniMalloc"}
+    memoryAllocStrategy : {"TetrisRandom", "TetrisCo-Opt", "MiniMalloc", "OmniMalloc"}
         Strategy for memory allocation.
+    omnimallocAllocator : str
+        OmniMalloc allocator used when memoryAllocStrategy is "OmniMalloc".
     searchStrategy : {"min", "max", "random-max"}
         Search strategy for constraint solving.
 
@@ -92,6 +94,9 @@ class Tiler():
 
     arenaName = "MEMORYARENA"
     memorySchedulerClass: Type[MemoryScheduler] = MemoryScheduler
+
+    # Strategies that place buffers after tiling instead of co-optimizing placement with the tiler
+    _decoupledAllocStrategies = ("MiniMalloc", "OmniMalloc")
 
     _MINIMALLOC_INPUT_FILENAME = "input_minimalloc"
     _MINIMALLOC_OUTPUT_FILENAME = "output_minimalloc"
@@ -119,7 +124,9 @@ class Tiler():
         self._worstCaseBufferSize: Dict[str, int] = {}
 
         self.visualizeMemoryAlloc: bool = False
-        self.memoryAllocStrategy: Literal["TetrisRandom", "TetrisCo-Opt", "MiniMalloc"] = "TetrisRandom"
+        self.memoryAllocStrategy: Literal["TetrisRandom", "TetrisCo-Opt", "MiniMalloc", "OmniMalloc"] = "TetrisRandom"
+        self.omnimallocAllocator: str = "supermalloc"
+        self.omnimallocAlignment: int = 1
         self.searchStrategy: Literal["min", "max", "random-max"] = "random-max"
 
         if workDir is not None:
@@ -361,6 +368,61 @@ class Tiler():
 
         return ctxt
 
+    def _memoryBlockSize(self,
+                         memoryBlock: MemoryBlock,
+                         ctxt: NetworkContext,
+                         nodeMemoryConstraint: Optional[NodeMemoryConstraint],
+                         memoryLevel: str,
+                         alignment: int = 1) -> int:
+        """Byte size of memoryBlock; each (multi-)buffer is padded to a multiple of alignment."""
+
+        def _align(size) -> int:
+            return -(-int(size) // alignment) * alignment
+
+        _buffer = ctxt.lookup(memoryBlock.name)
+        if nodeMemoryConstraint is None:
+            if isinstance(_buffer, TransientBuffer):
+                return _align(_buffer.size)
+            return _align(np.prod(_buffer.shape) * (_buffer._type.referencedType.typeWidth / 8))
+
+        memoryConstraint = nodeMemoryConstraint.tensorMemoryConstraints[memoryBlock.name].memoryConstraints[memoryLevel]
+        if isinstance(_buffer, TransientBuffer):
+            return _align(memoryConstraint.size)
+        if alignment == 1:
+            # Keep MiniMalloc's historical rounding of the product
+            return int(memoryConstraint.size * (_buffer._type.referencedType.typeWidth / 8) *
+                       memoryConstraint.multiBufferCoefficient)
+        return _align(memoryConstraint.size *
+                      (_buffer._type.referencedType.typeWidth / 8)) * int(memoryConstraint.multiBufferCoefficient)
+
+    def omnimalloc(self, memoryMap: List[MemoryBlock], ctxt: NetworkContext,
+                   nodeMemoryConstraint: Optional[NodeMemoryConstraint], capacity: int,
+                   memoryLevel: str) -> List[MemoryBlock]:
+        """Assign offsets to memoryMap's blocks in-process with OmniMalloc.
+
+        Lifetimes are inclusive in Deeploy and half-open in OmniMalloc, hence the +1.
+        The allocator minimizes the peak; the result is rejected if it exceeds capacity.
+        """
+        import omnimalloc as om
+
+        allocations = tuple(
+            om.Allocation(id = block.name,
+                          size = self._memoryBlockSize(block, ctxt, nodeMemoryConstraint, memoryLevel,
+                                                       self.omnimallocAlignment),
+                          start = block.lifetime[0],
+                          end = block.lifetime[1] + 1) for block in memoryMap)
+
+        placed = om.allocate(allocations, allocator = self.omnimallocAllocator)
+        peak = max(alloc.offset + alloc.size for alloc in placed)
+        if peak > capacity:
+            raise MemoryError(f"OmniMalloc ({self.omnimallocAllocator}) needs {peak} bytes at memory level "
+                              f"{memoryLevel}, but only {capacity} bytes are available!")
+
+        offsets = {alloc.id: alloc.offset for alloc in placed}
+        for block, alloc in zip(memoryMap, allocations):
+            block._addrSpace = (offsets[block.name], offsets[block.name] + alloc.size)
+        return memoryMap
+
     def minimalloc(self, memoryMap, ctxt, nodeMemoryConstraint, capacity: int, memoryLevel: str):
         """Perform memory allocation using the MiniMalloc external tool.
 
@@ -402,23 +464,7 @@ class Tiler():
             writer = csv.writer(file, lineterminator = "\n")
             writer.writerow(["id", "lower", "upper", "size"])
             for memoryBlock in memoryMap:
-
-                _buffer = ctxt.lookup(memoryBlock.name)
-                if nodeMemoryConstraint is None:
-                    _bufferSize = _buffer.size if isinstance(
-                        _buffer,
-                        TransientBuffer) else np.prod(_buffer.shape) * (_buffer._type.referencedType.typeWidth / 8)
-                else:
-                    if isinstance(_buffer, TransientBuffer):
-                        _bufferSize = nodeMemoryConstraint.tensorMemoryConstraints[
-                            memoryBlock.name].memoryConstraints[memoryLevel].size
-                    else:
-                        _bufferSize = nodeMemoryConstraint.tensorMemoryConstraints[
-                            memoryBlock.name].memoryConstraints[memoryLevel].size * (
-                                _buffer._type.referencedType.typeWidth /
-                                8) * nodeMemoryConstraint.tensorMemoryConstraints[
-                                    memoryBlock.name].memoryConstraints[memoryLevel].multiBufferCoefficient
-
+                _bufferSize = self._memoryBlockSize(memoryBlock, ctxt, nodeMemoryConstraint, memoryLevel)
                 writer.writerow([
                     memoryBlock.name,
                     str(memoryBlock.lifetime[0]),
@@ -483,7 +529,7 @@ class Tiler():
         assert self.tilerModel is not None and self.symbolicMemoryConstraints is not None, "Set up the model before trying to compute a schedule!"
         collector = self.tilerModel.trySolveModel()
         tilingSolution = self._getTilingSolution(self.tilerModel, ctxt, collector, self.symbolicMemoryConstraints)
-        if not self.memoryAllocStrategy == "MiniMalloc":
+        if self.memoryAllocStrategy not in self._decoupledAllocStrategies:
             assert self.tilerModel is not None
             log.debug(" - Extract Memory Allocation")
             self.innerMemoryScheduler.annotateSolution(ctxt, self.tilerModel)
@@ -519,18 +565,19 @@ class Tiler():
         for key in self.innerMemoryScheduler.memoryMap.keys():
             memoryMap[key] = [*self.innerMemoryScheduler.memoryMap[key], *self.outerMemoryScheduler.memoryMap[key]]
 
-        if self.memoryAllocStrategy == "MiniMalloc":
-            log.debug(" - Solve Memory Allocation with MiniMalloc")
+        if self.memoryAllocStrategy in self._decoupledAllocStrategies:
+            log.debug(f" - Solve Memory Allocation with {self.memoryAllocStrategy}")
+            allocate = self.omnimalloc if self.memoryAllocStrategy == "OmniMalloc" else self.minimalloc
             for memoryLevel in memoryMap.keys():
                 constantTensorOffset = self.outerMemoryScheduler.getConstantTensorOffset(ctxt, memoryLevel)
                 if memoryLevel == self.memoryHierarchy._defaultMemoryLevel.name:
-                    memoryMap[memoryLevel][-1] = self.minimalloc(
+                    memoryMap[memoryLevel][-1] = allocate(
                         memoryMap[memoryLevel][-1], ctxt, None,
                         self.memoryHierarchy.memoryLevels[memoryLevel].size - constantTensorOffset, memoryLevel)
                 else:
                     for idx, memMap in enumerate(memoryMap[memoryLevel]):
                         if len(memoryMap[memoryLevel][idx]) != 0:
-                            memoryMap[memoryLevel][idx] = self.minimalloc(
+                            memoryMap[memoryLevel][idx] = allocate(
                                 memMap, ctxt, tilingSolution[idx].nodeConstraints[0],
                                 self.memoryHierarchy.memoryLevels[memoryLevel].size - constantTensorOffset, memoryLevel)
             log.info(f" {SUCCESS_MARK} Memory allocation successful!")
@@ -1045,7 +1092,7 @@ class Tiler():
             for nodeConstraint in constraint.nodeConstraints:
                 outerMemoryConstraints.addConstraint(nodeConstraint)
 
-        if self.memoryAllocStrategy == "MiniMalloc":
+        if self.memoryAllocStrategy in self._decoupledAllocStrategies:
             # JUNGVI: This method adds the memory constraints in case of decoupled tiling and memory allocation.
             self.outerMemoryScheduler.constraintTileBuffersWithOverlappingLifetime(tilerModel, ctxt,
                                                                                    outerMemoryConstraints,
@@ -1060,7 +1107,7 @@ class Tiler():
         for level, memLevel in self.memoryHierarchy.memoryLevels.items():
             newMemLevel = copy.copy(memLevel)
 
-            if not self.memoryAllocStrategy == "MiniMalloc":
+            if self.memoryAllocStrategy not in self._decoupledAllocStrategies:
                 outerConstraint = tilerModel.getVariable(self.outerMemoryScheduler.getSymbolicCostName(0, level), 0)
                 newMemLevel.size = newMemLevel.size - outerConstraint
 
@@ -1848,7 +1895,7 @@ class TilerDeployerWrapper(NetworkDeployerWrapper):
 
         if tilingSolution is None and memoryMap is None:
             # JUNGVI: Currently using MiniMalloc is only supported for layer-wise execution and all tensors in the default memory level.
-            if self.tiler.memoryAllocStrategy == "MiniMalloc":
+            if self.tiler.memoryAllocStrategy in self.tiler._decoupledAllocStrategies:
                 assert self.tiler.assertLayerWiseTiling(schedule), "Using MiniMalloc and DFT is not supported!"
                 assert self.tiler.assertUniformMemoryLevelAllocation(
                     self.ctxt, self.Platform.memoryHierarchy._defaultMemoryLevel.name

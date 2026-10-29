@@ -487,7 +487,7 @@ class MemoryScheduler():
                 permutationList = self.heuristicPermutation(adjacencyMatrix, costVector)
                 permAdj, permCost, permutationMatrix = self._stablePermutation(adjacencyMatrix, costVector,
                                                                                permutationList)
-            elif memoryAllocStrategy == "MiniMalloc":
+            elif memoryAllocStrategy in ("MiniMalloc", "OmniMalloc"):
                 #JUNVI: When using MiniMalloc we don't perform memory allocation with Tiling, hence we don't add the permutation constraints
                 continue
             else:
