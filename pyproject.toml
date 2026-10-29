@@ -30,6 +30,7 @@ dependencies = [
 'ortools',
 'plotly',
 'coloredlogs',
+'omnimalloc>=1.0.0,<2',
 'pytest',
 'pytest-xdist',
 ]

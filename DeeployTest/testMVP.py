@@ -132,6 +132,8 @@ def setupDeployer(graph: gs.Graph, memoryHierarchy: MemoryHierarchy, defaultTarg
 
     deployer.tiler.visualizeMemoryAlloc = args.plotMemAlloc
     deployer.tiler.memoryAllocStrategy = args.memAllocStrategy
+    deployer.tiler.omnimallocAllocator = args.omnimallocAllocator
+    deployer.tiler.omnimallocAlignment = args.omnimallocAlignment
     deployer.tiler.searchStrategy = args.searchStrategy
 
     return deployer, signProp
@@ -187,6 +189,16 @@ if __name__ == '__main__':
                             - TetrisCo-Opt: Co-optimize the placement schedule with the tiling solver (works best with random-max solver strategy).
                             - MiniMalloc: Use SotA static memory allocator from https://dl.acm.org/doi/10.1145/3623278.3624752
                         """)
+    parser.add_argument('--omnimallocAllocator',
+                        dest = 'omnimallocAllocator',
+                        type = str,
+                        default = "supermalloc",
+                        help = 'OmniMalloc allocator used with --memAllocStrategy=OmniMalloc\n')
+    parser.add_argument('--omnimallocAlignment',
+                        dest = 'omnimallocAlignment',
+                        type = int,
+                        default = 1,
+                        help = 'Pad every OmniMalloc buffer to a multiple of this many bytes\n')
     parser.add_argument('--searchStrategy',
                         metavar = 'searchStrategy',
                         dest = 'searchStrategy',
